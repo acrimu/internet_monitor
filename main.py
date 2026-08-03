@@ -24,6 +24,8 @@ WIFI_PASSWORD = "18012008Ac"
 SCL_PIN = 5
 SDA_PIN = 4
 RELAY_PIN = 6                 # Change this to the GPIO wired to the relay.
+DISPLAY_BUTTON_PIN = 7        # Momentary button between this pin and GND.
+DISPLAY_TIMEOUT_S = 5 * 60
 
 # Set these for your relay/wiring. For many active-low relay modules, router
 # power ON is 0 and power OFF is 1. Verify this before connecting the router.
@@ -80,21 +82,106 @@ def create_display():
 
 
 oled = create_display()
+display_enabled = oled is not None
+display_deadline_ms = time.ticks_add(time.ticks_ms(), DISPLAY_TIMEOUT_S * 1000)
+display_button_event = False
+display_button_wait_release = False
+display_button_release_ms = None
+last_oled_title = "Monitor"
+last_oled_lines = ()
+
+
+def display_button_irq(pin):
+    """Latch a button press; all real work stays outside interrupt context."""
+    global display_button_event
+    display_button_event = True
+
+
+display_button = Pin(DISPLAY_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+display_button.irq(trigger=Pin.IRQ_FALLING, handler=display_button_irq)
+
+
+def render_oled(title, *lines):
+    """Render immediately without changing the saved display status."""
+    if oled is None or not display_enabled:
+        return
+    oled.fill(0)
+    oled.rect(0, 0, 128, 128, 1)
+    oled.text(title[:16], 4, 6, 1)
+    y = 24
+    for line in lines[:6]:
+        oled.text(str(line)[:16], 4, y, 1)
+        y += 16
+    oled.show()
+
+
+def set_oled_power(enabled):
+    """Power the OLED panel on or off using the available driver API."""
+    global display_enabled, display_deadline_ms
+    if oled is None or enabled == display_enabled:
+        return
+    try:
+        if enabled:
+            if hasattr(oled, "poweron"):
+                oled.poweron()
+            elif hasattr(oled, "sleep"):
+                oled.sleep(False)
+            else:
+                oled.write_cmd(0xAF)
+            display_enabled = True
+            display_deadline_ms = time.ticks_add(
+                time.ticks_ms(), DISPLAY_TIMEOUT_S * 1000
+            )
+            render_oled(last_oled_title, *last_oled_lines)
+            log_activity("DISPLAY ON")
+        else:
+            if hasattr(oled, "poweroff"):
+                oled.poweroff()
+            elif hasattr(oled, "sleep"):
+                oled.sleep(True)
+            else:
+                oled.write_cmd(0xAE)
+            display_enabled = False
+            log_activity("DISPLAY OFF")
+    except Exception as exc:
+        print("OLED power control failed:", exc)
+
+
+def handle_display_button():
+    """Accept one toggle per press and enforce the display timeout."""
+    global display_button_event, display_button_wait_release
+    global display_button_release_ms
+    now = time.ticks_ms()
+
+    if display_button_wait_release:
+        # Ignore contact bounce until the button has remained released HIGH
+        # continuously for at least 50 ms.
+        display_button_event = False
+        if display_button.value():
+            if display_button_release_ms is None:
+                display_button_release_ms = now
+            elif time.ticks_diff(now, display_button_release_ms) >= 50:
+                display_button_wait_release = False
+                display_button_release_ms = None
+        else:
+            display_button_release_ms = None
+    elif display_button_event:
+        display_button_event = False
+        display_button_wait_release = True
+        display_button_release_ms = None
+        set_oled_power(not display_enabled)
+
+    if display_enabled and time.ticks_diff(now, display_deadline_ms) >= 0:
+        set_oled_power(False)
 
 
 def show_on_oled(title, *lines):
     """Show status on the optional OLED without writing to serial."""
-    if oled is None:
-        return
+    global last_oled_title, last_oled_lines
+    last_oled_title = title
+    last_oled_lines = lines
     try:
-        oled.fill(0)
-        oled.rect(0, 0, 128, 128, 1)
-        oled.text(title[:16], 4, 6, 1)
-        y = 24
-        for line in lines[:6]:
-            oled.text(str(line)[:16], 4, y, 1)
-            y += 16
-        oled.show()
+        render_oled(title, *lines)
     except Exception as exc:
         print("OLED update failed:", exc)
 
@@ -284,6 +371,7 @@ def responsive_wait(seconds):
     started = time.ticks_ms()
     duration_ms = seconds * 1000
     while time.ticks_diff(time.ticks_ms(), started) < duration_ms:
+        handle_display_button()
         serve_log_request()
         time.sleep_ms(100)
 
@@ -345,6 +433,7 @@ def power_cycle_router():
             "power on",
             "wait {} sec".format(remaining_s),
         )
+        handle_display_button()
         serve_log_request()
         time.sleep(1)
 
