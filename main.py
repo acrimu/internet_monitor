@@ -6,6 +6,8 @@ the CONFIGURATION section before running it as main.py.
 
 from machine import Pin, I2C
 import network
+import ntptime
+import os
 import socket
 import time
 
@@ -42,6 +44,10 @@ CHECK_TARGETS = (
     ("8.8.8.8", 443),
 )
 SOCKET_TIMEOUT_S = 4
+
+LOG_FILE = "/activity.log"
+OLD_LOG_FILE = "/activity.old"
+LOG_MAX_BYTES = 64 * 1024
 # -------------------------------------------------------------------------
 
 
@@ -54,6 +60,7 @@ wlan.ifconfig((
     "192.168.1.1",
     "192.168.1.1",
 ))
+clock_is_synced = False
 
 
 def create_display():
@@ -70,10 +77,8 @@ def create_display():
 oled = create_display()
 
 
-def show_status(title, *lines):
-    """Print status and mirror it to the optional OLED."""
-    message = " | ".join((title,) + lines)
-    print(message)
+def show_on_oled(title, *lines):
+    """Show status on the optional OLED without writing to serial."""
     if oled is None:
         return
     try:
@@ -87,6 +92,56 @@ def show_status(title, *lines):
         oled.show()
     except Exception as exc:
         print("OLED update failed:", exc)
+
+
+def show_status(title, *lines):
+    """Print status and mirror it to the optional OLED."""
+    message = " | ".join((title,) + lines)
+    print(message)
+    show_on_oled(title, *lines)
+
+
+def log_activity(message):
+    """Append a UTC- or uptime-stamped event and rotate at 64 KB."""
+    try:
+        now = time.localtime()
+        if clock_is_synced:
+            timestamp = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z".format(
+                now[0], now[1], now[2], now[3], now[4], now[5]
+            )
+        else:
+            timestamp = "UPTIME:{:010d}".format(time.ticks_ms() // 1000)
+        entry = "{} {}\n".format(timestamp, message)
+
+        try:
+            log_size = os.stat(LOG_FILE)[6]
+        except OSError:
+            log_size = 0
+
+        if log_size + len(entry) > LOG_MAX_BYTES:
+            try:
+                os.remove(OLD_LOG_FILE)
+            except OSError:
+                pass
+            os.rename(LOG_FILE, OLD_LOG_FILE)
+
+        with open(LOG_FILE, "a") as log:
+            log.write(entry)
+    except OSError as exc:
+        print("Log write failed:", exc)
+
+
+def synchronize_time():
+    """Set the RTC to UTC using NTP; return True when successful."""
+    global clock_is_synced
+    try:
+        ntptime.settime()
+        clock_is_synced = True
+        log_activity("TIME SYNCED utc")
+        return True
+    except Exception as exc:
+        print("NTP sync failed:", exc)
+        return False
 
 
 def connect_wifi():
@@ -139,8 +194,14 @@ def power_cycle_router():
     time.sleep(ROUTER_POWER_OFF_S)
 
     relay.value(ROUTER_POWER_ON_LEVEL)
-    show_status("ROUTER RESET", "power on", "wait {} sec".format(ROUTER_BOOT_WAIT_S))
-    time.sleep(ROUTER_BOOT_WAIT_S)
+    show_status("ROUTER RESET", "power on")
+    for remaining_s in range(ROUTER_BOOT_WAIT_S, 0, -1):
+        show_on_oled(
+            "ROUTER RESET",
+            "power on",
+            "wait {} sec".format(remaining_s),
+        )
+        time.sleep(1)
 
     # Force a fresh association after the access point returns.
     wlan.disconnect()
@@ -157,7 +218,10 @@ def main():
     internet_fail_count = 0
     router_reset_count = 0
     last_reset_ms = None
+    previous_online = None
+    time_synced = False
     show_status("Monitor start", "router power ON")
+    log_activity("MONITOR START router_power=ON")
 
     while True:
         connected = connect_wifi()
@@ -166,6 +230,16 @@ def main():
         if online:
             failed_checks = 0
             internet_ok_count += 1
+            if not time_synced:
+                time_synced = synchronize_time()
+            if previous_online is not True:
+                log_activity(
+                    "INTERNET UP ip={} ok={} failed={}".format(
+                        wlan.ifconfig()[0],
+                        internet_ok_count,
+                        internet_fail_count,
+                    )
+                )
             show_status(
                 "Internet OK",
                 wlan.ifconfig()[0],
@@ -176,6 +250,13 @@ def main():
         else:
             failed_checks += 1
             internet_fail_count += 1
+            if previous_online is not False:
+                log_activity(
+                    "INTERNET DOWN consecutive={} failed={}".format(
+                        failed_checks,
+                        internet_fail_count,
+                    )
+                )
             show_status(
                 "Internet DOWN",
                 "failure {}/{}".format(failed_checks, FAILED_CHECKS_BEFORE_RESET),
@@ -183,6 +264,8 @@ def main():
                 "Failed: {}".format(internet_fail_count),
                 "Resets: {}".format(router_reset_count),
             )
+
+        previous_online = online
 
         if failed_checks >= FAILED_CHECKS_BEFORE_RESET:
             now = time.ticks_ms()
@@ -192,6 +275,12 @@ def main():
             )
             if cooldown_over:
                 router_reset_count += 1
+                log_activity(
+                    "ROUTER RESET count={} failed={}".format(
+                        router_reset_count,
+                        internet_fail_count,
+                    )
+                )
                 power_cycle_router()
                 last_reset_ms = time.ticks_ms()
                 failed_checks = 0
