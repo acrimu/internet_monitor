@@ -48,6 +48,7 @@ SOCKET_TIMEOUT_S = 4
 LOG_FILE = "/activity.log"
 OLD_LOG_FILE = "/activity.old"
 LOG_MAX_BYTES = 64 * 1024
+LOG_HTTP_PORT = 80
 # -------------------------------------------------------------------------
 
 
@@ -61,6 +62,10 @@ wlan.ifconfig((
     "192.168.1.1",
 ))
 clock_is_synced = False
+log_server = None
+log_client = None
+log_client_deadline_ms = 0
+log_request_buffer = b""
 
 
 def create_display():
@@ -144,6 +149,145 @@ def synchronize_time():
         return False
 
 
+def send_all(client, data):
+    """Send all bytes on a MicroPython socket."""
+    sent_total = 0
+    while sent_total < len(data):
+        sent = client.send(data[sent_total:])
+        if not sent:
+            raise OSError("socket closed while sending")
+        sent_total += sent
+
+
+def send_http_response(client, status, content_type, content):
+    """Send a complete in-memory HTTP response."""
+    header = (
+        "HTTP/1.1 {}\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(status, content_type, len(content))
+    send_all(client, header.encode())
+    send_all(client, content)
+
+
+def send_log_file(client, filename):
+    """Stream a log file without loading all 64 KB into RAM."""
+    try:
+        file_size = os.stat(filename)[6]
+    except OSError:
+        send_http_response(client, "404 Not Found", "text/plain", b"Log not found\n")
+        return
+
+    header = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Content-Length: {}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(file_size)
+    send_all(client, header.encode())
+    with open(filename, "rb") as log:
+        while True:
+            chunk = log.read(512)
+            if not chunk:
+                break
+            send_all(client, chunk)
+
+
+def start_log_server():
+    """Start the non-blocking LAN log server once Wi-Fi is connected."""
+    global log_server
+    if log_server is not None:
+        return
+    server = None
+    try:
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", LOG_HTTP_PORT))
+        server.listen(1)
+        server.setblocking(False)
+        log_server = server
+        print("Log server: http://{}:{}/".format(wlan.ifconfig()[0], LOG_HTTP_PORT))
+    except OSError as exc:
+        if server is not None:
+            server.close()
+        print("Log server start failed:", exc)
+
+
+def serve_log_request():
+    """Advance one pending browser request without blocking the monitor."""
+    global log_client, log_client_deadline_ms, log_request_buffer
+    if log_server is None:
+        return
+
+    if log_client is None:
+        try:
+            log_client, _ = log_server.accept()
+            log_client.setblocking(False)
+            log_client_deadline_ms = time.ticks_add(time.ticks_ms(), 3000)
+            log_request_buffer = b""
+        except OSError:
+            return
+
+    try:
+        chunk = log_client.recv(512)
+        if not chunk:
+            log_client.close()
+            log_client = None
+            log_request_buffer = b""
+            return
+        log_request_buffer += chunk
+    except OSError:
+        if time.ticks_diff(time.ticks_ms(), log_client_deadline_ms) >= 0:
+            log_client.close()
+            log_client = None
+            log_request_buffer = b""
+        return
+
+    if b"\n" not in log_request_buffer and len(log_request_buffer) < 1024:
+        return
+
+    client = log_client
+    try:
+        client.settimeout(2)
+        request_line = log_request_buffer.split(b"\n", 1)[0].rstrip(b"\r")
+        parts = request_line.split()
+        path = parts[1].split(b"?", 1)[0] if len(parts) >= 2 else b""
+
+        if path == b"/log":
+            send_log_file(client, LOG_FILE)
+        elif path == b"/log-old":
+            send_log_file(client, OLD_LOG_FILE)
+        elif path == b"/":
+            page = (
+                b"<!doctype html><meta name='viewport' content='width=device-width'>"
+                b"<title>ESP32 Internet Monitor</title>"
+                b"<h1>ESP32 Internet Monitor</h1>"
+                b"<p><a href='/log'>Current activity log</a></p>"
+                b"<p><a href='/log-old'>Previous activity log</a></p>"
+            )
+            send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
+        else:
+            send_http_response(client, "404 Not Found", "text/plain", b"Not found\n")
+    except OSError as exc:
+        print("Log server request failed:", exc)
+    finally:
+        client.close()
+        log_client = None
+        log_request_buffer = b""
+
+
+def responsive_wait(seconds):
+    """Wait while continuing to handle browser log requests."""
+    started = time.ticks_ms()
+    duration_ms = seconds * 1000
+    while time.ticks_diff(time.ticks_ms(), started) < duration_ms:
+        serve_log_request()
+        time.sleep_ms(100)
+
+
 def connect_wifi():
     """Connect to the configured access point within a fixed timeout."""
     if wlan.isconnected():
@@ -201,6 +345,7 @@ def power_cycle_router():
             "power on",
             "wait {} sec".format(remaining_s),
         )
+        serve_log_request()
         time.sleep(1)
 
     # Force a fresh association after the access point returns.
@@ -225,6 +370,9 @@ def main():
 
     while True:
         connected = connect_wifi()
+        if connected:
+            start_log_server()
+            serve_log_request()
         online = connected and internet_is_available()
 
         if online:
@@ -288,7 +436,7 @@ def main():
                 remaining_ms = RESET_COOLDOWN_S * 1000 - time.ticks_diff(now, last_reset_ms)
                 show_status("Reset blocked", "cooldown {} sec".format(remaining_ms // 1000))
 
-        time.sleep(CHECK_INTERVAL_S)
+        responsive_wait(CHECK_INTERVAL_S)
 
 
 try:
