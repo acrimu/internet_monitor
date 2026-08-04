@@ -1,10 +1,11 @@
 """Wi-Fi/internet monitor with automatic router power cycling.
 
-Copy this file and sh1107.py to the MicroPython device.  Adjust the values in
-the CONFIGURATION section before running it as main.py.
+Copy main.py, config.py, and sh1107.py to the MicroPython device. Adjust
+deployment settings in config.py before running main.py.
 """
 
 from machine import Pin, I2C
+import config
 import network
 import ntptime
 import os
@@ -18,8 +19,13 @@ except ImportError:
 
 
 # ----------------------------- CONFIGURATION -----------------------------
-WIFI_SSID = "ac2478ch"
-WIFI_PASSWORD = "18012008Ac"
+WIFI_SSID = config.WIFI_SSID
+WIFI_PASSWORD = config.WIFI_PASSWORD
+NETWORK_MODE = config.NETWORK_MODE
+STATIC_IP = config.STATIC_IP
+STATIC_GATEWAY = config.STATIC_GATEWAY
+STATIC_DNS = config.STATIC_DNS
+TIMEZONE = config.TIMEZONE
 
 SCL_PIN = 5
 SDA_PIN = 4
@@ -54,15 +60,148 @@ LOG_HTTP_PORT = 80
 # -------------------------------------------------------------------------
 
 
+def validate_ipv4(value, setting_name):
+    """Validate an IPv4 address and return its normalized text."""
+    parts = value.split(".")
+    if len(parts) != 4:
+        raise ValueError("{} must be an IPv4 address".format(setting_name))
+    normalized = []
+    for part in parts:
+        try:
+            number = int(part)
+        except ValueError:
+            raise ValueError("{} must be an IPv4 address".format(setting_name))
+        if number < 0 or number > 255:
+            raise ValueError("{} must be an IPv4 address".format(setting_name))
+        normalized.append(str(number))
+    return ".".join(normalized)
+
+
+def prefix_to_netmask(prefix):
+    """Convert a CIDR prefix length to a dotted IPv4 netmask."""
+    try:
+        prefix = int(prefix)
+    except ValueError:
+        raise ValueError("STATIC_IP must include a CIDR mask such as /24")
+    if prefix < 0 or prefix > 32:
+        raise ValueError("STATIC_IP CIDR mask must be between /0 and /32")
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix else 0
+    return "{}.{}.{}.{}".format(
+        (mask >> 24) & 255,
+        (mask >> 16) & 255,
+        (mask >> 8) & 255,
+        mask & 255,
+    )
+
+
+def configure_network_interface(interface):
+    """Apply DHCP or validated static IPv4 settings from config.py."""
+    mode = str(NETWORK_MODE).strip().lower()
+    if mode == "static":
+        address_parts = str(STATIC_IP).split("/")
+        if len(address_parts) != 2:
+            raise ValueError("STATIC_IP must look like 192.168.1.3/24")
+        address = validate_ipv4(address_parts[0], "STATIC_IP")
+        netmask = prefix_to_netmask(address_parts[1])
+        gateway = validate_ipv4(str(STATIC_GATEWAY), "STATIC_GATEWAY")
+        dns = validate_ipv4(str(STATIC_DNS), "STATIC_DNS")
+        interface.ifconfig((address, netmask, gateway, dns))
+    elif mode == "dhcp":
+        # Reactivating the interface selects DHCP on ESP32. Newer MicroPython
+        # versions also expose ipconfig(dhcp4=True), so use it when available.
+        try:
+            interface.ipconfig(dhcp4=True)
+        except (AttributeError, TypeError, OSError):
+            pass
+    else:
+        raise ValueError('NETWORK_MODE must be "static" or "dhcp"')
+
+
+def days_in_month(year, month):
+    if month == 2:
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return 29 if leap else 28
+    return 30 if month in (4, 6, 9, 11) else 31
+
+
+def weekday_sunday_zero(year, month, day):
+    """Return weekday using Sunday=0 without requiring a timezone database."""
+    offsets = (0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4)
+    adjusted_year = year - 1 if month < 3 else year
+    return (
+        adjusted_year
+        + adjusted_year // 4
+        - adjusted_year // 100
+        + adjusted_year // 400
+        + offsets[month - 1]
+        + day
+    ) % 7
+
+
+def berlin_is_dst(utc_now):
+    """Apply the EU rule: last Sunday of March through last Sunday of October."""
+    year, month, day, hour = utc_now[0], utc_now[1], utc_now[2], utc_now[3]
+    if 4 <= month <= 9:
+        return True
+    if month < 3 or month > 10:
+        return False
+
+    last_day = days_in_month(year, month)
+    last_sunday = last_day - weekday_sunday_zero(year, month, last_day)
+    if month == 3:
+        return day > last_sunday or (day == last_sunday and hour >= 1)
+    return day < last_sunday or (day == last_sunday and hour < 1)
+
+
+def timezone_offset_minutes(utc_now):
+    """Return configured offset minutes and its ISO-8601 suffix."""
+    zone = str(TIMEZONE).strip()
+    if zone.upper() == "UTC":
+        return 0, "Z"
+    if zone.lower() == "europe/berlin":
+        if berlin_is_dst(utc_now):
+            return 120, "+02:00"
+        return 60, "+01:00"
+
+    if len(zone) == 6 and zone[0] in ("+", "-") and zone[3] == ":":
+        try:
+            hours = int(zone[1:3])
+            minutes = int(zone[4:6])
+        except ValueError:
+            hours = 99
+            minutes = 99
+        if hours <= 23 and minutes <= 59:
+            offset = hours * 60 + minutes
+            if zone[0] == "-":
+                offset = -offset
+            return offset, zone
+
+    raise ValueError(
+        'TIMEZONE must be "UTC", "Europe/Berlin", or an offset such as "+05:30"'
+    )
+
+
+def format_log_timestamp():
+    """Format the synchronized UTC RTC using the configured timezone."""
+    utc_now = time.gmtime()
+    offset_minutes, suffix = timezone_offset_minutes(utc_now)
+    local_now = time.gmtime(time.time() + offset_minutes * 60)
+    return "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}{}".format(
+        local_now[0],
+        local_now[1],
+        local_now[2],
+        local_now[3],
+        local_now[4],
+        local_now[5],
+        suffix,
+    )
+
+
 relay = Pin(RELAY_PIN, Pin.OUT, value=ROUTER_POWER_ON_LEVEL)
 wlan = network.WLAN(network.STA_IF)
+wlan.active(False)
 wlan.active(True)
-wlan.ifconfig((
-    "192.168.1.3",
-    "255.255.255.0",
-    "192.168.1.1",
-    "192.168.1.1",
-))
+configure_network_interface(wlan)
 clock_is_synced = False
 log_server = None
 log_client = None
@@ -194,13 +333,10 @@ def show_status(title, *lines):
 
 
 def log_activity(message):
-    """Append a UTC- or uptime-stamped event and rotate at 64 KB."""
+    """Append a configured-timezone or uptime event and rotate at 64 KB."""
     try:
-        now = time.localtime()
         if clock_is_synced:
-            timestamp = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z".format(
-                now[0], now[1], now[2], now[3], now[4], now[5]
-            )
+            timestamp = format_log_timestamp()
         else:
             timestamp = "UPTIME:{:010d}".format(time.ticks_ms() // 1000)
         entry = "{} {}\n".format(timestamp, message)
@@ -227,12 +363,15 @@ def synchronize_time():
     """Set the RTC to UTC using NTP; return True when successful."""
     global clock_is_synced
     try:
+        # Validate the configured zone independently of the NTP operation.
+        timezone_offset_minutes(time.gmtime())
         ntptime.settime()
         clock_is_synced = True
-        log_activity("TIME SYNCED utc")
+        log_activity("TIME SYNCED timezone={}".format(TIMEZONE))
         return True
     except Exception as exc:
-        print("NTP sync failed:", exc)
+        clock_is_synced = False
+        print("Time sync/configuration failed:", exc)
         return False
 
 
