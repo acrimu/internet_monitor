@@ -38,12 +38,12 @@ DISPLAY_TIMEOUT_S = 5 * 60
 ROUTER_POWER_ON_LEVEL = 0
 ROUTER_POWER_OFF_LEVEL = 1
 
-CHECK_INTERVAL_S = 15
-FAILED_CHECKS_BEFORE_RESET = 4   # 4 * 15 seconds = about 1 minute offline.
-ROUTER_POWER_OFF_S = 10
-ROUTER_BOOT_WAIT_S = 120
+CHECK_INTERVAL_S = 30     # Default 15 sec
+FAILED_CHECKS_BEFORE_RESET = 8   # 8 * 30 sec = 4 min offline. Default 4 * 15 seconds = about 1 minute offline.
+ROUTER_POWER_OFF_S = 15   # Router powers off for 15 sec
+ROUTER_BOOT_WAIT_S = 120  # Waits for router reboot
 WIFI_CONNECT_TIMEOUT_S = 25
-RESET_COOLDOWN_S = 10 * 60       # Never power-cycle more than once per 10 min.
+RESET_COOLDOWN_S = 30 * 60       # Never power-cycle more than once per 30 min.
 
 # Numeric addresses avoid relying on DNS. A successful TCP connection to any
 # target counts as internet access. Port 443 is generally firewall-friendly.
@@ -197,6 +197,15 @@ def format_log_timestamp():
     )
 
 
+def serial_print(*parts):
+    """Print a timestamped line to the serial console."""
+    if clock_is_synced:
+        timestamp = format_log_timestamp()
+    else:
+        timestamp = "UPTIME:{:010d}".format(time.ticks_ms() // 1000)
+    print(timestamp, *parts)
+
+
 relay = Pin(RELAY_PIN, Pin.OUT, value=ROUTER_POWER_ON_LEVEL)
 wlan = network.WLAN(network.STA_IF)
 wlan.active(False)
@@ -216,7 +225,7 @@ def create_display():
         i2c = I2C(0, scl=Pin(SCL_PIN), sda=Pin(SDA_PIN), freq=400000)
         return sh1107.SH1107_I2C(128, 128, i2c, address=0x3C, rotate=0)
     except Exception as exc:
-        print("OLED unavailable:", exc)
+        serial_print("OLED unavailable:", exc)
         return None
 
 
@@ -283,7 +292,7 @@ def set_oled_power(enabled):
             display_enabled = False
             log_activity("DISPLAY OFF")
     except Exception as exc:
-        print("OLED power control failed:", exc)
+        serial_print("OLED power control failed:", exc)
 
 
 def handle_display_button():
@@ -322,13 +331,13 @@ def show_on_oled(title, *lines):
     try:
         render_oled(title, *lines)
     except Exception as exc:
-        print("OLED update failed:", exc)
+        serial_print("OLED update failed:", exc)
 
 
 def show_status(title, *lines):
     """Print status and mirror it to the optional OLED."""
     message = " | ".join((title,) + lines)
-    print(message)
+    serial_print(message)
     show_on_oled(title, *lines)
 
 
@@ -356,7 +365,7 @@ def log_activity(message):
         with open(LOG_FILE, "a") as log:
             log.write(entry)
     except OSError as exc:
-        print("Log write failed:", exc)
+        serial_print("Log write failed:", exc)
 
 
 def synchronize_time():
@@ -371,7 +380,7 @@ def synchronize_time():
         return True
     except Exception as exc:
         clock_is_synced = False
-        print("Time sync/configuration failed:", exc)
+        serial_print("Time sync/configuration failed:", exc)
         return False
 
 
@@ -435,11 +444,11 @@ def start_log_server():
         server.listen(1)
         server.setblocking(False)
         log_server = server
-        print("Log server: http://{}:{}/".format(wlan.ifconfig()[0], LOG_HTTP_PORT))
+        serial_print("Log server: http://{}:{}/".format(wlan.ifconfig()[0], LOG_HTTP_PORT))
     except OSError as exc:
         if server is not None:
             server.close()
-        print("Log server start failed:", exc)
+        serial_print("Log server start failed:", exc)
 
 
 def serve_log_request():
@@ -498,7 +507,7 @@ def serve_log_request():
         else:
             send_http_response(client, "404 Not Found", "text/plain", b"Not found\n")
     except OSError as exc:
-        print("Log server request failed:", exc)
+        serial_print("Log server request failed:", exc)
     finally:
         client.close()
         log_client = None
