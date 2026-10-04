@@ -1,0 +1,19 @@
+# Local runtime output
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Device logs
+activity.log
+activity.old
+*.log
+
+# Local Wi-Fi and device secrets
+config.py
+config - Copy.py
+
+# Editor and OS files
+.vscode/
+.DS_Store
+Thumbs.db
