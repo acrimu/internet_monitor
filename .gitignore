@@ -9,9 +9,7 @@ activity.log
 activity.old
 *.log
 
-# Local Wi-Fi and device secrets
-config.py
-config - Copy.py
+ignore/
 
 # Editor and OS files
 .vscode/
