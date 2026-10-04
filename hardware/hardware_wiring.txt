@@ -1,0 +1,70 @@
+ESP32-S3 Internet Monitor - Hardware Wiring
+==========================================
+Generic ESP32S3 module with Octal-SPIRAM with ESP32S3 running MicroPython v1.28.0 on 2026-04-06
+
+Display (SH1107 OLED, 128x128, I2C)
+------------------------------------
+- Display connector pins used by the code:
+  - GPIO 5  -> SCL
+  - GPIO 4  -> SDA
+- I2C bus:
+  - I2C(0, scl=Pin(5), sda=Pin(4), freq=400000)
+- Display address:
+  - 0x3C
+- Power:
+  - Display VCC -> ESP32 3V3 (or appropriate display supply)
+  - Display GND -> ESP32 GND
+- I2C wiring:
+  - SH1107 SCL -> ESP32 GPIO 5
+  - SH1107 SDA -> ESP32 GPIO 4
+- Driver note:
+  - The code creates the display with:
+    sh1107.SH1107_I2C(128, 128, i2c, address=0x3C, rotate=0)
+
+Display button
+--------------
+- Button pin used by the code:
+  - GPIO 7 -> display button input
+- Button wiring:
+  - GPIO 7 -> one side of the momentary button
+  - Button other side -> GND
+- Input settings:
+  - Pin(DISPLAY_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+- Behavior:
+  - The button is wired as a momentary push button to ground.
+  - It uses the internal pull-up so the signal is normally HIGH and goes LOW when pressed.
+  - The board uses the falling-edge IRQ trigger.
+
+Relay for router power control
+------------------------------
+- Relay control pin used by the code:
+  - GPIO 6 -> relay control
+- Relay wiring:
+  - ESP32 GPIO 6 -> relay control input
+  - Relay module power -> 3V3 or appropriate module supply
+  - Relay module GND -> ESP32 GND
+- Relay logic in the code:
+  - RELAY_PIN = 6
+  - ROUTER_POWER_ON_LEVEL = 0
+  - ROUTER_POWER_OFF_LEVEL = 1
+- Important note:
+  - The project assumes a relay module where the active-low state corresponds to router ON.
+  - Many relay boards use active-low logic, so the code sets:
+    - router power ON = 0
+    - router power OFF = 1
+  - Verify this for your actual relay board before connecting to the router power circuit.
+
+Recommended summary
+-------------------
+- ESP32 GPIO 5  -> OLED SCL
+- ESP32 GPIO 4  -> OLED SDA
+- ESP32 GPIO 7  -> Display button to GND
+- ESP32 GPIO 6  -> Relay control signal
+- ESP32 GND     -> OLED GND, button return path, relay GND
+- ESP32 3V3     -> OLED VCC, relay module power if required by the board
+
+Notes
+-----
+- The code currently assumes the OLED is wired to I2C bus 0 and uses the SH1107 128x128 display driver.
+- The display button is not a high-current load; it is a simple momentary input to ground.
+- The relay control line must be connected to the router's power-switching circuit only if you are absolutely sure of the polarity and voltage requirements.
