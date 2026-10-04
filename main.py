@@ -408,47 +408,27 @@ def send_http_response(client, status, content_type, content):
 
 
 def send_log_file(client, filename):
-    """Stream a log file with newest entries first without loading all 64 KB into RAM."""
+    """Stream a log file without loading all 64 KB into RAM."""
     try:
         file_size = os.stat(filename)[6]
     except OSError:
         send_http_response(client, "404 Not Found", "text/plain", b"Log not found\n")
         return
 
-    try:
-        with open(filename, "rb") as log:
-            data = log.read()
-    except OSError as exc:
-        serial_print("Log read failed:", exc)
-        send_http_response(client, "500 Internal Server Error", "text/plain", b"Log read failed\n")
-        return
-
-    if not data:
-        header = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain; charset=utf-8\r\n"
-            "Content-Length: 0\r\n"
-            "Cache-Control: no-store\r\n"
-            "Connection: close\r\n\r\n"
-        )
-        send_all(client, header.encode())
-        return
-
-    lines = data.splitlines(True)
-    reversed_lines = []
-    for i in range(len(lines) - 1, -1, -1):
-        reversed_lines.append(lines[i])
-
-    output = b"".join(reversed_lines)
     header = (
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Content-Length: {}\r\n"
         "Cache-Control: no-store\r\n"
         "Connection: close\r\n\r\n"
-    ).format(len(output))
+    ).format(file_size)
     send_all(client, header.encode())
-    send_all(client, output)
+    with open(filename, "rb") as log:
+        while True:
+            chunk = log.read(512)
+            if not chunk:
+                break
+            send_all(client, chunk)
 
 
 def start_log_server():
@@ -516,38 +496,62 @@ def serve_log_request():
         query = parts[1].split(b"?", 1)[1] if len(parts) >= 2 and b"?" in parts[1] else b""
 
         if path == b"/log":
-            send_log_file(client, LOG_FILE)
+            send_http_response(client, "302 Found", "text/plain", b"")
+            return
         elif path == b"/log-old":
+            send_http_response(client, "302 Found", "text/plain", b"")
+            return
+        elif path == b"/api/log":
+            send_log_file(client, LOG_FILE)
+        elif path == b"/api/log-old":
             send_log_file(client, OLD_LOG_FILE)
         elif path == b"/power-cycle":
             if query == b"confirm=yes":
                 power_cycle_router()
                 page = (
-                    b"<!doctype html><meta name='viewport' content='width=device-width'>"
+                    b"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
                     b"<title>Router power cycle</title>"
+                    b"<style>body{font-family:Arial,sans-serif;margin:0;padding:16px;background:#111;color:#eee}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}.btn{padding:12px 16px;border:none;border-radius:8px;background:#2a5d9f;color:white;font-weight:bold;cursor:pointer;width:220px;text-align:center;text-decoration:none;display:inline-block}.status{margin-top:20px;padding:12px;border:1px solid #555;border-radius:8px;background:#1a1a1a}</style>"
                     b"<h1>Router power cycle</h1>"
-                    b"<p>Power cycle was triggered.</p>"
-                    b"<p><a href='/'>Back to monitor</a></p>"
+                    b"<div class='status'>Power cycle was triggered.</div>"
+                    b"<div class='buttons'><button class='btn' onclick=\"history.back()\">Back</button></div>"
                 )
                 send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
             else:
                 page = (
-                    b"<!doctype html><meta name='viewport' content='width=device-width'>"
+                    b"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
                     b"<title>Confirm router power cycle</title>"
+                    b"<style>body{font-family:Arial,sans-serif;margin:0;padding:16px;background:#111;color:#eee}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}.btn{padding:12px 16px;border:none;border-radius:8px;background:#2a5d9f;color:white;font-weight:bold;cursor:pointer;width:220px;text-align:center;text-decoration:none;display:inline-block}.btn.secondary{background:#333}</style>"
                     b"<h1>Confirm router power cycle</h1>"
                     b"<p>Do you really want to power cycle the router?</p>"
-                    b"<p><a href='/power-cycle?confirm=yes'>Yes, power cycle now</a></p>"
-                    b"<p><a href='/'>No, cancel</a></p>"
+                    b"<div class='buttons'>"
+                    b"<button class='btn' onclick=\"location.href='/power-cycle?confirm=yes'\">Yes, power cycle now</button>"
+                    b"<button class='btn secondary' onclick=\"history.back()\">No, cancel</button>"
+                    b"</div>"
                 )
                 send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
         elif path == b"/":
             page = (
-                b"<!doctype html><meta name='viewport' content='width=device-width'>"
+                b"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
                 b"<title>ESP32 Internet Monitor</title>"
+                b"<style>body{font-family:Arial,sans-serif;margin:0;padding:16px;background:#111;color:#eee}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}.btn{padding:12px 16px;border:none;border-radius:8px;background:#2a5d9f;color:white;font-weight:bold;cursor:pointer;width:220px;text-align:center;text-decoration:none;display:inline-block}.btn.secondary{background:#2a5d9f}.btn.danger{background:#b22222}.logbox{width:100%;height:70vh;padding:12px;border:1px solid #555;border-radius:8px;background:#1a1a1a;color:#eee;font-family:monospace;font-size:12px;white-space:pre-wrap;overflow:auto;box-sizing:border-box;margin-top:12px;display:none}.visible{display:block}.hidden{display:none}.status{margin-top:12px;padding:12px;border:1px solid #555;border-radius:8px;background:#1a1a1a;display:none}.status.visible{display:block}</style>"
                 b"<h1>ESP32 Internet Monitor</h1>"
-                b"<p><a href='/log'>Current activity log</a></p>"
-                b"<p><a href='/log-old'>Previous activity log</a></p>"
-                b"<p><a href='/power-cycle'>Power cycle router</a></p>"
+                b"<div class='buttons'>"
+                b"<button class='btn' onclick=\"showLog('/api/log')\">Current activity log</button>"
+                b"<button class='btn' onclick=\"showLog('/api/log-old')\">Previous activity log</button>"
+                b"<button class='btn danger' onclick=\"powerCycle()\">Power cycle router</button>"
+                b"</div>"
+                b"<div class='buttons'><button class='btn secondary' id='hideBtn' onclick=\"hideLog()\">Hide log</button></div>"
+                b"<div id='statusBox' class='status'></div>"
+                b"<div id='logPanel' class='logbox'></div>"
+                b"<script>"
+                b"const panel=document.getElementById('logPanel');const hideBtn=document.getElementById('hideBtn');const statusBox=document.getElementById('statusBox');"
+                b"let activeUrl='';let timer=null;"
+                b"function hideLog(){clearInterval(timer); panel.classList.remove('visible'); panel.classList.add('hidden'); panel.textContent=''; activeUrl=''; hideBtn.style.display='none'; statusBox.classList.remove('visible'); statusBox.textContent='';}"
+                b"function showLog(url){activeUrl=url; panel.classList.remove('hidden'); panel.classList.add('visible'); hideBtn.style.display='inline-block'; statusBox.classList.remove('visible'); statusBox.textContent=''; function renderLog(text){panel.textContent=text; panel.scrollTop = panel.scrollHeight; } fetch(url).then(r=>r.text()).then(renderLog).catch(()=>{panel.textContent='Unable to load log';}); clearInterval(timer); timer=setInterval(function(){if(activeUrl){fetch(activeUrl).then(r=>r.text()).then(renderLog).catch(()=>{});}},10000);}"
+                b"function powerCycle(){if(!confirm('Do you really want to power cycle the router?')) return; hideLog(); statusBox.textContent='Power cycle requested...'; statusBox.classList.add('visible'); fetch('/power-cycle?confirm=yes').then(r=>r.text()).then(t=>{statusBox.textContent='Power cycle was triggered.';}).catch(()=>{statusBox.textContent='Power cycle request failed.';});}"
+                b"hideBtn.style.display='none';"
+                b"</script>"
             )
             send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
         else:
