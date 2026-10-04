@@ -530,16 +530,37 @@ def connect_wifi():
         return True
 
     show_status("WiFi", "connecting...")
-    wlan.disconnect()
+    try:
+        wlan.disconnect()
+    except Exception:
+        pass
     time.sleep_ms(250)
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+
+    try:
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    except Exception as exc:
+        show_status("WiFi failed", "connect error: {}".format(exc))
+        return False
 
     started = time.ticks_ms()
     timeout_ms = WIFI_CONNECT_TIMEOUT_S * 1000
+    last_status = None
     while not wlan.isconnected():
+        status = wlan.status()
+        if status != last_status:
+            show_status("WiFi", "status: {}".format(status))
+            last_status = status
+
         if time.ticks_diff(time.ticks_ms(), started) >= timeout_ms:
-            show_status("WiFi failed", "status: {}".format(wlan.status()))
+            show_status("WiFi failed", "status: {}".format(status))
+            try:
+                wlan.disconnect()
+            except Exception:
+                pass
             return False
+
+        handle_display_button()
+        serve_log_request()
         time.sleep_ms(500)
 
     ip_address = wlan.ifconfig()[0]
