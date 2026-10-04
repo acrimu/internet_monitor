@@ -408,27 +408,47 @@ def send_http_response(client, status, content_type, content):
 
 
 def send_log_file(client, filename):
-    """Stream a log file without loading all 64 KB into RAM."""
+    """Stream a log file with newest entries first without loading all 64 KB into RAM."""
     try:
         file_size = os.stat(filename)[6]
     except OSError:
         send_http_response(client, "404 Not Found", "text/plain", b"Log not found\n")
         return
 
+    try:
+        with open(filename, "rb") as log:
+            data = log.read()
+    except OSError as exc:
+        serial_print("Log read failed:", exc)
+        send_http_response(client, "500 Internal Server Error", "text/plain", b"Log read failed\n")
+        return
+
+    if not data:
+        header = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Length: 0\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        send_all(client, header.encode())
+        return
+
+    lines = data.splitlines(True)
+    reversed_lines = []
+    for i in range(len(lines) - 1, -1, -1):
+        reversed_lines.append(lines[i])
+
+    output = b"".join(reversed_lines)
     header = (
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Content-Length: {}\r\n"
         "Cache-Control: no-store\r\n"
         "Connection: close\r\n\r\n"
-    ).format(file_size)
+    ).format(len(output))
     send_all(client, header.encode())
-    with open(filename, "rb") as log:
-        while True:
-            chunk = log.read(512)
-            if not chunk:
-                break
-            send_all(client, chunk)
+    send_all(client, output)
 
 
 def start_log_server():
@@ -476,7 +496,10 @@ def serve_log_request():
         log_request_buffer += chunk
     except OSError:
         if time.ticks_diff(time.ticks_ms(), log_client_deadline_ms) >= 0:
-            log_client.close()
+            try:
+                log_client.close()
+            except Exception:
+                pass
             log_client = None
             log_request_buffer = b""
         return
@@ -490,11 +513,33 @@ def serve_log_request():
         request_line = log_request_buffer.split(b"\n", 1)[0].rstrip(b"\r")
         parts = request_line.split()
         path = parts[1].split(b"?", 1)[0] if len(parts) >= 2 else b""
+        query = parts[1].split(b"?", 1)[1] if len(parts) >= 2 and b"?" in parts[1] else b""
 
         if path == b"/log":
             send_log_file(client, LOG_FILE)
         elif path == b"/log-old":
             send_log_file(client, OLD_LOG_FILE)
+        elif path == b"/power-cycle":
+            if query == b"confirm=yes":
+                power_cycle_router()
+                page = (
+                    b"<!doctype html><meta name='viewport' content='width=device-width'>"
+                    b"<title>Router power cycle</title>"
+                    b"<h1>Router power cycle</h1>"
+                    b"<p>Power cycle was triggered.</p>"
+                    b"<p><a href='/'>Back to monitor</a></p>"
+                )
+                send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
+            else:
+                page = (
+                    b"<!doctype html><meta name='viewport' content='width=device-width'>"
+                    b"<title>Confirm router power cycle</title>"
+                    b"<h1>Confirm router power cycle</h1>"
+                    b"<p>Do you really want to power cycle the router?</p>"
+                    b"<p><a href='/power-cycle?confirm=yes'>Yes, power cycle now</a></p>"
+                    b"<p><a href='/'>No, cancel</a></p>"
+                )
+                send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
         elif path == b"/":
             page = (
                 b"<!doctype html><meta name='viewport' content='width=device-width'>"
@@ -502,6 +547,7 @@ def serve_log_request():
                 b"<h1>ESP32 Internet Monitor</h1>"
                 b"<p><a href='/log'>Current activity log</a></p>"
                 b"<p><a href='/log-old'>Previous activity log</a></p>"
+                b"<p><a href='/power-cycle'>Power cycle router</a></p>"
             )
             send_http_response(client, "200 OK", "text/html; charset=utf-8", page)
         else:
@@ -509,7 +555,10 @@ def serve_log_request():
     except OSError as exc:
         serial_print("Log server request failed:", exc)
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
         log_client = None
         log_request_buffer = b""
 
@@ -673,7 +722,7 @@ def main():
 
         previous_online = online
 
-        if failed_checks >= FAILED_CHECKS_BEFORE_RESET:
+        if not connected and failed_checks >= FAILED_CHECKS_BEFORE_RESET:
             now = time.ticks_ms()
             cooldown_over = (
                 last_reset_ms is None
@@ -682,9 +731,10 @@ def main():
             if cooldown_over:
                 router_reset_count += 1
                 log_activity(
-                    "ROUTER RESET count={} failed={}".format(
+                    "ROUTER RESET count={} failed={} wifi_lost={}".format(
                         router_reset_count,
                         internet_fail_count,
+                        not connected,
                     )
                 )
                 power_cycle_router()
@@ -693,6 +743,8 @@ def main():
             else:
                 remaining_ms = RESET_COOLDOWN_S * 1000 - time.ticks_diff(now, last_reset_ms)
                 show_status("Reset blocked", "cooldown {} sec".format(remaining_ms // 1000))
+        elif connected and online is False and failed_checks >= FAILED_CHECKS_BEFORE_RESET:
+            show_status("Internet degraded", "waiting for recovery")
 
         responsive_wait(CHECK_INTERVAL_S)
 
