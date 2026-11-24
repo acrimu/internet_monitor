@@ -18,6 +18,8 @@ except ImportError:
     sh1107 = None
 
 
+FIRMWARE_VERSION = "1.0.0"
+
 # ----------------------------- CONFIGURATION -----------------------------
 WIFI_SSID = config.WIFI_SSID
 WIFI_PASSWORD = config.WIFI_PASSWORD
@@ -43,7 +45,9 @@ FAILED_CHECKS_BEFORE_RESET = 8   # 8 * 30 sec = 4 min offline. Default 4 * 15 se
 ROUTER_POWER_OFF_S = 15   # Router powers off for 15 sec
 ROUTER_BOOT_WAIT_S = 120  # Waits for router reboot
 WIFI_CONNECT_TIMEOUT_S = 25
-RESET_COOLDOWN_S = 30 * 60       # Never power-cycle more than once per 30 min.
+RESET_COOLDOWN_S = 30 * 60
+EXTENDED_RESET_COOLDOWN_S = 2 * 60 * 60
+SHORT_COOLDOWN_RETRIES = 2
 
 # Numeric addresses avoid relying on DNS. A successful TCP connection to any
 # target counts as internet access. Port 443 is generally firewall-friendly.
@@ -536,7 +540,8 @@ def serve_log_request():
                 b"<title>ESP32 Internet Monitor</title>"
                 b"<style>body{font-family:Arial,sans-serif;margin:0;padding:16px;background:#111;color:#eee}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}.btn{padding:12px 16px;border:none;border-radius:8px;background:#2a5d9f;color:white;font-weight:bold;cursor:pointer;width:220px;text-align:center;text-decoration:none;display:inline-block}.btn.secondary{background:#2a5d9f}.btn.danger{background:#b22222}.logbox{width:100%;height:70vh;padding:12px;border:1px solid #555;border-radius:8px;background:#1a1a1a;color:#eee;font-family:monospace;font-size:12px;white-space:pre-wrap;overflow:auto;box-sizing:border-box;margin-top:12px;display:none}.visible{display:block}.hidden{display:none}.status{margin-top:12px;padding:12px;border:1px solid #555;border-radius:8px;background:#1a1a1a;display:none}.status.visible{display:block}</style>"
                 b"<h1>ESP32 Internet Monitor</h1>"
-                b"<div class='buttons'>"
+                b"<p>Firmware version: " + FIRMWARE_VERSION.encode("utf-8") +
+                b"</p><div class='buttons'>"
                 b"<button class='btn' onclick=\"showLog('/api/log')\">Current activity log</button>"
                 b"<button class='btn' onclick=\"showLog('/api/log-old')\">Previous activity log</button>"
                 b"<button class='btn danger' onclick=\"powerCycle()\">Power cycle router</button>"
@@ -673,6 +678,7 @@ def main():
     internet_ok_count = 0
     internet_fail_count = 0
     router_reset_count = 0
+    outage_reset_count = 0
     last_reset_ms = None
     previous_online = None
     time_synced = False
@@ -688,6 +694,7 @@ def main():
 
         if online:
             failed_checks = 0
+            outage_reset_count = 0
             internet_ok_count += 1
             if not time_synced:
                 time_synced = synchronize_time()
@@ -726,14 +733,22 @@ def main():
 
         previous_online = online
 
-        if not connected and failed_checks >= FAILED_CHECKS_BEFORE_RESET:
+        # A WAN outage can leave the ESP32 associated with the router, so use
+        # the internet probe result rather than Wi-Fi association to decide
+        # when a router reset is needed.
+        if not online and failed_checks >= FAILED_CHECKS_BEFORE_RESET:
             now = time.ticks_ms()
+            cooldown_ms = RESET_COOLDOWN_S * 1000
+            # The initial power cycle is followed by two short-cooldown retries.
+            if outage_reset_count > SHORT_COOLDOWN_RETRIES:
+                cooldown_ms = EXTENDED_RESET_COOLDOWN_S * 1000
             cooldown_over = (
                 last_reset_ms is None
-                or time.ticks_diff(now, last_reset_ms) >= RESET_COOLDOWN_S * 1000
+                or time.ticks_diff(now, last_reset_ms) >= cooldown_ms
             )
             if cooldown_over:
                 router_reset_count += 1
+                outage_reset_count += 1
                 log_activity(
                     "ROUTER RESET count={} failed={} wifi_lost={}".format(
                         router_reset_count,
@@ -745,11 +760,8 @@ def main():
                 last_reset_ms = time.ticks_ms()
                 failed_checks = 0
             else:
-                remaining_ms = RESET_COOLDOWN_S * 1000 - time.ticks_diff(now, last_reset_ms)
+                remaining_ms = cooldown_ms - time.ticks_diff(now, last_reset_ms)
                 show_status("Reset blocked", "cooldown {} sec".format(remaining_ms // 1000))
-        elif connected and online is False and failed_checks >= FAILED_CHECKS_BEFORE_RESET:
-            show_status("Internet degraded", "waiting for recovery")
-
         responsive_wait(CHECK_INTERVAL_S)
 
 
