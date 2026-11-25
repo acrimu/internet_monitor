@@ -18,7 +18,7 @@ except ImportError:
     sh1107 = None
 
 
-FIRMWARE_VERSION = "1.0.0"
+FIRMWARE_VERSION = "1.0.0 - 25 Nov 2026"
 
 # ----------------------------- CONFIGURATION -----------------------------
 WIFI_SSID = config.WIFI_SSID
